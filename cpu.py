@@ -116,12 +116,41 @@ class Y86Simulator:
         byte0 = self.read_mem(self.PC, 1)
         if self.STAT != AOK: return
         
-        # 已经为你提取出了当前指令的操作码，请保留下方两条赋值，继续向下实现
         self.icode = byte0 >> 4
         self.ifun = byte0 & 0x0F
         
-        # TODO: 请在此处实现取指阶段的完整逻辑
-        pass
+        # 验证 icode 合法性
+        if self.icode not in (I_HALT, I_NOP, I_RRMOVQ, I_IRMOVQ,
+                              I_RMMOVQ, I_MRMOVQ, I_ALU, I_JMP,
+                              I_CALL, I_RET, I_PUSHQ, I_POPQ):
+            self.STAT = INS
+            return
+        
+        # halt 指令：置 HLT 并停止
+        if self.icode == I_HALT:
+            self.STAT = HLT
+            return
+        
+        # 需要寄存器指示符字节的指令
+        if self.icode in (I_RRMOVQ, I_IRMOVQ, I_RMMOVQ, I_MRMOVQ, I_ALU, I_PUSHQ, I_POPQ):
+            reg_byte = self.read_mem(self.PC + 1, 1)
+            if self.STAT != AOK:
+                return
+            self.rA = reg_byte >> 4
+            self.rB = reg_byte & 0x0F
+            valP_offset = 2
+        else:
+            valP_offset = 1
+        
+        # 需要 8 字节常数的指令
+        if self.icode in (I_IRMOVQ, I_RMMOVQ, I_MRMOVQ, I_JMP, I_CALL):
+            self.valC = self.read_mem(self.PC + valP_offset, 8)
+            if self.STAT != AOK:
+                return
+            valP_offset += 8
+        
+        # 计算下一条指令地址
+        self.valP = self.PC + valP_offset
 
     def decode(self):
         """
@@ -135,8 +164,19 @@ class Y86Simulator:
         srcA = RNONE
         srcB = RNONE
         
-        # TODO: 请在此处实现译码阶段的完整逻辑，正确设置 srcA 和 srcB，并读取赋值给 valA 和 valB
-        pass
+        # 确定 srcA / srcB
+        if self.icode in (I_RRMOVQ, I_RMMOVQ, I_ALU, I_PUSHQ):
+            srcA = self.rA
+        if self.icode in (I_RRMOVQ, I_RMMOVQ, I_MRMOVQ, I_ALU, I_POPQ):
+            srcB = self.rB
+        if self.icode in (I_POPQ, I_RET):
+            srcA = RSP
+        if self.icode in (I_PUSHQ, I_POPQ, I_CALL, I_RET):
+            srcB = RSP
+        
+        # 读取寄存器值 (RNONE 读作 0)
+        self.valA = self.REG[srcA]
+        self.valB = self.REG[srcB]
 
     def execute(self):
         """
@@ -161,8 +201,63 @@ class Y86Simulator:
         aluA = 0
         aluB = 0
         
-        # TODO: 请在此处实现执行阶段的完整逻辑，包含 ALU 运算、条件码更新和分支跳转判定
-        pass
+        # 设置 ALU 操作数
+        if self.icode == I_ALU:
+            aluA = self.valA
+            aluB = self.valB
+        elif self.icode in (I_RMMOVQ, I_MRMOVQ):
+            aluA = self.valC
+            aluB = self.valB
+        elif self.icode in (I_PUSHQ, I_CALL):
+            aluB = self.valB
+            aluA = -8
+        elif self.icode in (I_POPQ, I_RET):
+            aluB = self.valB
+            aluA = 8
+        elif self.icode == I_IRMOVQ:
+            aluA = self.valC
+            aluB = 0
+        elif self.icode == I_RRMOVQ:
+            aluA = self.valA
+            aluB = 0
+        else:
+            aluA = 0
+            aluB = 0
+        
+        # 执行 ALU 运算
+        # 注意 Y86-64 语义: OPq rA, rB 表示 rB = rB OP rA
+        # 即 aluA=valA(=rA), aluB=valB(=rB), 结果 valE = valB OP valA
+        if self.icode == I_ALU:
+            a = self.to_signed64(aluA)
+            b = self.to_signed64(aluB)
+            if self.ifun == 0:        # addq: rB = rB + rA
+                result = b + a
+                self.valE = self.uint64(result)
+                of = 1 if (result > 0x7FFFFFFFFFFFFFFF or result < -0x8000000000000000) else 0
+            elif self.ifun == 1:      # subq: rB = rB - rA
+                result = b - a
+                self.valE = self.uint64(result)
+                of = 1 if (result > 0x7FFFFFFFFFFFFFFF or result < -0x8000000000000000) else 0
+            elif self.ifun == 2:      # andq: rB = rB & rA
+                result = b & a
+                self.valE = self.uint64(result)
+                of = 0
+            elif self.ifun == 3:      # xorq: rB = rB ^ rA
+                result = b ^ a
+                self.valE = self.uint64(result)
+                of = 0
+            else:
+                self.valE = self.uint64(aluA + aluB)
+                of = 0
+            self.CC["ZF"] = 1 if self.valE == 0 else 0
+            self.CC["SF"] = 1 if (self.valE & 0x8000000000000000) else 0
+            self.CC["OF"] = of
+        else:
+            self.valE = self.uint64(aluA + aluB)
+        
+        # 条件判断 (jXX / cmovXX)
+        if self.icode in (I_JMP, I_RRMOVQ):
+            self.Cnd = self.check_cond(self.ifun)
 
     def memory_stage(self):
         """
@@ -177,8 +272,20 @@ class Y86Simulator:
         """
         self.valM = 0
         
-        # TODO: 请在此处实现访存阶段的完整读写逻辑
-        pass
+        # 写内存
+        if self.icode in (I_RMMOVQ, I_PUSHQ, I_CALL):
+            addr = self.valE
+            if self.icode == I_RMMOVQ:
+                self.write_mem(addr, 8, self.valA)
+            elif self.icode == I_PUSHQ:
+                self.write_mem(addr, 8, self.valA)
+            elif self.icode == I_CALL:
+                self.write_mem(addr, 8, self.valP)
+        
+        # 读内存
+        if self.icode in (I_MRMOVQ, I_POPQ, I_RET):
+            addr = self.valE if self.icode == I_MRMOVQ else self.valA
+            self.valM = self.read_mem(addr, 8)
 
     def write_back(self):
         """
@@ -194,8 +301,26 @@ class Y86Simulator:
         dstE = RNONE
         dstM = RNONE
         
-        # TODO: 请在此处实现寄存器写回的完整逻辑
-        pass
+        # 确定 dstE
+        if self.icode in (I_IRMOVQ, I_RRMOVQ, I_ALU, I_MRMOVQ):
+            dstE = self.rB
+        elif self.icode in (I_PUSHQ, I_POPQ, I_CALL, I_RET):
+            dstE = RSP
+        
+        # 确定 dstM
+        if self.icode in (I_MRMOVQ, I_POPQ):
+            dstM = self.rA
+        
+        # 写回 valE (cmovXX 需 Cnd 为真)
+        if dstE != RNONE:
+            if self.icode == I_RRMOVQ and not self.Cnd:
+                pass
+            else:
+                self.REG[dstE] = self.uint64(self.valE)
+        
+        # 写回 valM (后写，保证 popq %rsp 时 valM 覆盖 valE)
+        if dstM != RNONE:
+            self.REG[dstM] = self.uint64(self.valM)
 
     def update_pc(self):
         """
@@ -208,7 +333,14 @@ class Y86Simulator:
         - 其它默认情况：PC 顺序更新为下一条指令的地址 (valP)。
         """
         # TODO: 请在此处实现 PC 更新逻辑
-        pass
+        if self.icode == I_CALL:
+            self.PC = self.valC
+        elif self.icode == I_JMP:
+            self.PC = self.valC if self.Cnd else self.valP
+        elif self.icode == I_RET:
+            self.PC = self.valM
+        else:
+            self.PC = self.valP
 
     # ---------------- JSON 序列化输出 ----------------
     def dump_state(self):
